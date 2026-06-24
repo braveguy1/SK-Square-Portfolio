@@ -1,0 +1,466 @@
+const express = require('express');
+const axios = require('axios');
+const https = require('https');
+const path = require('path');
+const XLSX = require('xlsx');
+const fs = require('fs');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 정적 파일 서빙
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ============================================
+// 한국투자증권 API 설정
+// ============================================
+const KIS_CONFIG = {
+  APP_KEY: process.env.KIS_APP_KEY || 'your_app_key_here',
+  APP_SECRET: process.env.KIS_APP_SECRET || 'your_app_secret_here',
+  BASE_URL: 'https://openapivts.koreainvestment.com:9443',
+};
+
+// 반도체 관련 종목 정의
+const SEMICONDUCTOR_STOCKS = [
+  { code: '005930', name: '삼성전자', market: 'KOSPI' },
+  { code: '000660', name: 'SK하이닉스', market: 'KOSPI' },
+  { code: '009540', name: '한미반도체', market: 'KOSPI' },
+  { code: '078020', name: '이퓨전', market: 'KOSPI' },
+  { code: '058970', name: '에이프로', market: 'KOSDAQ' },
+];
+
+// 토큰 파일 경로
+const TOKEN_FILE = path.join(__dirname, 'token.json');
+
+// ============================================
+// 토큰 관리
+// ============================================
+
+/**
+ * 토큰 파일에서 로드
+ */
+function loadTokenFromFile() {
+  try {
+    if (!fs.existsSync(TOKEN_FILE)) {
+      return null;
+    }
+
+    const data = fs.readFileSync(TOKEN_FILE, 'utf-8');
+    const tokenData = JSON.parse(data);
+
+    // 토큰 유효성 확인 (만료되지 않았으면 사용)
+    if (tokenData.token && tokenData.expireTime && Date.now() < tokenData.expireTime) {
+      console.log('✓ 저장된 토큰 사용 (유효시간:', new Date(tokenData.expireTime).toLocaleString('ko-KR'), ')');
+      return tokenData.token;
+    }
+
+    console.log('⏰ 토큰 만료됨. 새로운 토큰 발급 필요');
+    return null;
+  } catch (error) {
+    console.error('❌ 토큰 파일 읽기 실패:', error.message);
+    return null;
+  }
+}
+
+/**
+ * 토큰을 파일에 저장
+ */
+function saveTokenToFile(token, expiresIn) {
+  try {
+    const expireTime = Date.now() + (expiresIn - 300) * 1000; // 5분 여유
+    const tokenData = {
+      token,
+      expireTime,
+      issuedAt: new Date().toLocaleString('ko-KR'),
+      expiresAt: new Date(expireTime).toLocaleString('ko-KR'),
+    };
+
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2), 'utf-8');
+    console.log('💾 토큰 파일 저장됨 (유효기간: ' + Math.floor(expiresIn / 3600) + '시간)');
+    console.log('   저장 시간:', tokenData.issuedAt);
+    console.log('   만료 시간:', tokenData.expiresAt);
+  } catch (error) {
+    console.error('❌ 토큰 파일 저장 실패:', error.message);
+  }
+}
+
+// ============================================
+// 한국투자증권 API 함수들
+// ============================================
+
+/**
+ * 액세스 토큰 발급 (파일 기반 - 하루에 한번만)
+ */
+async function getAccessToken() {
+  try {
+    // 1. 저장된 토큰 확인
+    const savedToken = loadTokenFromFile();
+    if (savedToken) {
+      return savedToken;
+    }
+
+    console.log('📤 새로운 토큰 발급 요청 중...');
+
+    // 2. 새 토큰 발급
+    const httpsAgent = new https.Agent({
+      rejectUnauthorized: false,
+    });
+
+    const response = await axios.post(
+      `${KIS_CONFIG.BASE_URL}/oauth2/tokenP`,
+      {
+        grant_type: 'client_credentials',
+        appkey: KIS_CONFIG.APP_KEY,
+        appsecret: KIS_CONFIG.APP_SECRET,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        httpsAgent: httpsAgent,
+      }
+    );
+
+    const newToken = response.data.access_token;
+    const expiresIn = response.data.expires_in;
+
+    // 3. 토큰 파일 저장
+    saveTokenToFile(newToken, expiresIn);
+
+    console.log('✓ KIS 액세스 토큰 신규 발급됨');
+    return newToken;
+  } catch (error) {
+    console.error('❌ 토큰 발급 실패:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * 국내주식 시세 조회
+ */
+async function getStockQuote(stockCode) {
+  try {
+    const token = await getAccessToken();
+
+    const httpsAgent = new https.Agent({
+      rejectUnauthorized: false,
+    });
+
+    const response = await axios.get(
+      `${KIS_CONFIG.BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price`,
+      {
+        params: {
+          fid_cond_mrkt_div_code: 'J',
+          fid_input_iscd: stockCode.padStart(6, '0'),
+        },
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          Authorization: `Bearer ${token}`,
+          'appkey': KIS_CONFIG.APP_KEY,
+          'appsecret': KIS_CONFIG.APP_SECRET,
+          'tr-id': 'FHKST01010100',
+        },
+        httpsAgent: httpsAgent,
+      }
+    );
+
+    if (response.data.rt_cd !== '0') {
+      throw new Error(response.data.msg1 || '조회 실패');
+    }
+
+    const data = response.data.output;
+    return {
+      code: stockCode,
+      price: parseInt(data.stck_prpr),
+      change: parseInt(data.prdy_ctrt),
+      changePercent: parseFloat(data.prdy_clpr),
+      volume: parseInt(data.acml_vol),
+      amount: parseInt(data.acml_tr_pbmn),
+      high: parseInt(data.stck_hgpr),
+      low: parseInt(data.stck_lwpr),
+      timestamp: new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error(`❌ ${stockCode} 조회 실패:`, error.message);
+    return {
+      code: stockCode,
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+
+// ============================================
+// 포트폴리오 관리
+// ============================================
+
+/**
+ * 포트폴리오 엑셀 파일 읽기
+ */
+function readPortfolioExcel() {
+  try {
+    const portfolioPath = path.join(
+      process.env.USERPROFILE || process.env.HOME,
+      'Desktop',
+      'portfolio',
+      'portfolio.xlsx'
+    );
+
+    if (!fs.existsSync(portfolioPath)) {
+      console.warn('⚠️  포트폴리오 파일을 찾을 수 없습니다:', portfolioPath);
+      return [];
+    }
+
+    const workbook = XLSX.readFile(portfolioPath);
+    const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json(worksheet);
+
+    return data.map(row => ({
+      종목명: row['종목명'] || row['종목이름'] || '',
+      종목코드: String(row['종목코드']).padStart(6, '0'),
+      보유수량: parseInt(row['보유수량']) || 0,
+      매입가: parseInt(row['매입가']) || 0,
+    }));
+  } catch (error) {
+    console.error('❌ 포트폴리오 파일 읽기 실패:', error.message);
+    return [];
+  }
+}
+
+// ============================================
+// API 엔드포인트
+// ============================================
+
+/**
+ * 모든 반도체 종목 데이터 조회
+ */
+app.get('/api/semiconductors', async (req, res) => {
+  try {
+    const promises = SEMICONDUCTOR_STOCKS.map((stock) =>
+      getStockQuote(stock.code)
+        .then((quote) => ({
+          ...stock,
+          ...quote,
+        }))
+        .catch((error) => ({
+          ...stock,
+          error: error.message,
+        }))
+    );
+
+    const results = await Promise.all(promises);
+    res.json({
+      success: true,
+      data: results,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 포트폴리오 데이터 조회
+ */
+app.get('/api/portfolio', async (req, res) => {
+  try {
+    const portfolio = readPortfolioExcel();
+
+    if (!portfolio.length) {
+      return res.json({
+        success: true,
+        data: [],
+        summary: {
+          totalEvaluationAmount: 0,
+          totalInvestmentAmount: 0,
+          totalProfitLoss: 0,
+          totalProfitLossPercent: 0,
+          holdingCount: 0,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // 각 종목별 현재가 조회
+    const portfolioWithPrices = await Promise.all(
+      portfolio.map(async (item) => {
+        const quote = await getStockQuote(item.종목코드);
+
+        const currentPrice = quote.price || 0;
+        const quantity = item.보유수량;
+        const purchasePrice = item.매입가;
+
+        const evaluationAmount = currentPrice * quantity;
+        const investmentAmount = purchasePrice * quantity;
+        const profitLoss = evaluationAmount - investmentAmount;
+        const profitLossPercent =
+          investmentAmount > 0
+            ? ((profitLoss / investmentAmount) * 100).toFixed(2)
+            : 0;
+
+        return {
+          ...item,
+          currentPrice,
+          evaluationAmount,
+          investmentAmount,
+          profitLoss,
+          profitLossPercent: parseFloat(profitLossPercent),
+          priceChange: quote.change || 0,
+          priceChangePercent: quote.changePercent || 0,
+        };
+      })
+    );
+
+    // 요약 통계
+    const totalEvaluationAmount = portfolioWithPrices.reduce(
+      (sum, item) => sum + item.evaluationAmount,
+      0
+    );
+    const totalInvestmentAmount = portfolioWithPrices.reduce(
+      (sum, item) => sum + item.investmentAmount,
+      0
+    );
+    const totalProfitLoss = totalEvaluationAmount - totalInvestmentAmount;
+    const totalProfitLossPercent =
+      totalInvestmentAmount > 0
+        ? ((totalProfitLoss / totalInvestmentAmount) * 100).toFixed(2)
+        : 0;
+
+    res.json({
+      success: true,
+      data: portfolioWithPrices,
+      summary: {
+        totalEvaluationAmount,
+        totalInvestmentAmount,
+        totalProfitLoss,
+        totalProfitLossPercent: parseFloat(totalProfitLossPercent),
+        holdingCount: portfolioWithPrices.length,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('❌ 포트폴리오 조회 실패:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 특정 종목 데이터 조회
+ */
+app.get('/api/semiconductors/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const stock = SEMICONDUCTOR_STOCKS.find((s) => s.code === code);
+
+    if (!stock) {
+      return res.status(404).json({
+        success: false,
+        error: '종목을 찾을 수 없습니다',
+      });
+    }
+
+    const quote = await getStockQuote(code);
+    res.json({
+      success: true,
+      data: {
+        ...stock,
+        ...quote,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 지원하는 종목 목록
+ */
+app.get('/api/stocks-list', (req, res) => {
+  res.json({
+    success: true,
+    data: SEMICONDUCTOR_STOCKS,
+  });
+});
+
+/**
+ * 토큰 상태 조회
+ */
+app.get('/api/token-status', (req, res) => {
+  try {
+    if (!fs.existsSync(TOKEN_FILE)) {
+      return res.json({
+        success: true,
+        status: '토큰 없음',
+        message: '토큰이 저장되지 않았습니다. 처음 조회 시 발급됩니다.',
+      });
+    }
+
+    const data = fs.readFileSync(TOKEN_FILE, 'utf-8');
+    const tokenData = JSON.parse(data);
+
+    const remainingTime = tokenData.expireTime - Date.now();
+    const remainingHours = Math.floor(remainingTime / 3600000);
+    const isValid = remainingTime > 0;
+
+    res.json({
+      success: true,
+      status: isValid ? '유효' : '만료됨',
+      issuedAt: tokenData.issuedAt,
+      expiresAt: tokenData.expiresAt,
+      remainingHours: isValid ? remainingHours : 0,
+      remainingMinutes: isValid ? Math.floor((remainingTime % 3600000) / 60000) : 0,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 상태 체크
+ */
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    status: 'Server is running',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ============================================
+// 서버 시작
+// ============================================
+
+app.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════╗
+║   반도체 대시보드 서버 시작             ║
+║   http://localhost:${PORT}                ║
+╚════════════════════════════════════════╝
+  `);
+  console.log('📊 지원 종목:', SEMICONDUCTOR_STOCKS.map((s) => s.name).join(', '));
+  console.log('\n📍 대시보드:');
+  console.log('   반도체: http://localhost:3000');
+  console.log('   포트폴리오: http://localhost:3000/portfolio.html');
+  console.log('\n🔐 토큰 관리:');
+  console.log('   파일 위치:', TOKEN_FILE);
+  console.log('   상태 확인: http://localhost:3000/api/token-status');
+  console.log('\n⚡ 동작 원리:');
+  console.log('   1️⃣  첫 조회: 새로운 토큰 발급 → token.json 저장');
+  console.log('   2️⃣  이후 조회: 저장된 토큰 사용');
+  console.log('   3️⃣  토큰 만료: 새로운 토큰 발급');
+});
+
+module.exports = app;
