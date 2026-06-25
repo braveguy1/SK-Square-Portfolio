@@ -18,6 +18,19 @@ const TOSS_CONFIG = {
   BASE_URL: 'https://api.tosspayments.com/v1',
 };
 
+console.log(`
+╔════════════════════════════════════════╗
+║   🔍 API 설정 확인                     ║
+╚════════════════════════════════════════╝
+`);
+console.log('📌 TOSS_API_KEY 설정:');
+if (TOSS_CONFIG.API_KEY === 'your_toss_api_key_here') {
+  console.log('   ❌ 설정 안 됨!');
+} else {
+  console.log('   ✅ 설정됨 (처음 10자:', TOSS_CONFIG.API_KEY.substring(0, 10) + '...)');
+}
+console.log('📌 BASE_URL:', TOSS_CONFIG.BASE_URL);
+
 // 반도체 종목
 const SEMICONDUCTOR_STOCKS = [
   { code: '005930', name: '삼성전자' },
@@ -27,17 +40,24 @@ const SEMICONDUCTOR_STOCKS = [
   { code: '058970', name: '에이프로' },
 ];
 
+// 테스트 데이터
+const TEST_DATA = {
+  '005930': { price: 65000, name: '삼성전자' },
+  '000660': { price: 125000, name: 'SK하이닉스' },
+  '009540': { price: 155000, name: '한미반도체' },
+  '078020': { price: 45000, name: '이퓨전' },
+  '058970': { price: 8000, name: '에이프로' },
+};
+
 // ============================================
 // 토스증권 시세 조회
 // ============================================
 
-/**
- * 주식 시세 조회 (토스 API)
- */
 async function getStockQuote(stockCode) {
   try {
-    console.log(`🔍 종목 조회: ${stockCode}`);
-
+    console.log(`\n🔍 종목 조회 시도: ${stockCode}`);
+    console.log(`   API_KEY 있나?: ${TOSS_CONFIG.API_KEY !== 'your_toss_api_key_here' ? '✅ 있음' : '❌ 없음'}`);
+    
     const response = await axios.get(
       `${TOSS_CONFIG.BASE_URL}/stock/quote`,
       {
@@ -51,36 +71,29 @@ async function getStockQuote(stockCode) {
       }
     );
 
-    console.log(`   ✓ 현재가: ${response.data.currentPrice}원`);
-
+    console.log(`   ✅ API 성공! 현재가: ${response.data.currentPrice}원`);
+    
     return {
       code: stockCode,
       price: response.data.currentPrice,
       change: response.data.change || 0,
       changePercent: response.data.changePercent || 0,
-      high: response.data.high || response.data.currentPrice,
-      low: response.data.low || response.data.currentPrice,
-      volume: response.data.volume || 0,
       timestamp: new Date().toISOString(),
+      source: 'TOSS_API',
     };
   } catch (error) {
-    console.error(`   ❌ ${stockCode} 조회 실패:`, error.message);
+    console.log(`   ❌ API 실패: ${error.response?.status || error.message}`);
+    console.log(`   📌 Fallback 테스트 데이터 사용`);
     
-    // 실패 시 테스트 데이터 반환
-    const testPrices = {
-      '005930': 65000,
-      '000660': 125000,
-      '009540': 155000,
-      '078020': 45000,
-      '058970': 8000,
-    };
-
+    // 테스트 데이터 반환
+    const testPrice = TEST_DATA[stockCode];
     return {
       code: stockCode,
-      price: testPrices[stockCode] || 50000,
+      price: testPrice?.price || 50000,
       change: 0,
       changePercent: 0,
       timestamp: new Date().toISOString(),
+      source: 'TEST_DATA',
     };
   }
 }
@@ -89,9 +102,6 @@ async function getStockQuote(stockCode) {
 // 포트폴리오 관리
 // ============================================
 
-/**
- * 포트폴리오 엑셀 파일 읽기
- */
 function readPortfolioExcel() {
   try {
     const portfolioPath = path.join(
@@ -126,9 +136,6 @@ function readPortfolioExcel() {
 // API 엔드포인트
 // ============================================
 
-/**
- * 모든 반도체 종목 조회
- */
 app.get('/api/semiconductors', async (req, res) => {
   try {
     const promises = SEMICONDUCTOR_STOCKS.map((stock) =>
@@ -153,9 +160,6 @@ app.get('/api/semiconductors', async (req, res) => {
   }
 });
 
-/**
- * 특정 종목 조회
- */
 app.get('/api/semiconductors/:code', async (req, res) => {
   try {
     const { code } = req.params;
@@ -184,9 +188,6 @@ app.get('/api/semiconductors/:code', async (req, res) => {
   }
 });
 
-/**
- * 포트폴리오 조회
- */
 app.get('/api/portfolio', async (req, res) => {
   try {
     const portfolio = readPortfolioExcel();
@@ -260,7 +261,6 @@ app.get('/api/portfolio', async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error('❌ 포트폴리오 조회 실패:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -268,34 +268,23 @@ app.get('/api/portfolio', async (req, res) => {
   }
 });
 
-/**
- * 상태 체크
- */
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
-    status: 'Server is running (Toss API)',
-    provider: 'Toss Securities',
+    status: 'Server is running',
+    tossApiKey: TOSS_CONFIG.API_KEY !== 'your_toss_api_key_here' ? '✅ 설정됨' : '❌ 설정 안 됨',
     timestamp: new Date().toISOString(),
   });
 });
-
-// ============================================
-// 서버 시작
-// ============================================
 
 app.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════╗
 ║   SK Square 포트폴리오 서버 시작      ║
-║   🏦 토스증권 API 연동                ║
-║   http://localhost:${PORT}                ║
+║   포트: ${PORT}                          ║
 ╚════════════════════════════════════════╝
   `);
-  console.log('\n📊 지원 종목:', SEMICONDUCTOR_STOCKS.map((s) => s.name).join(', '));
-  console.log('\n🔌 API 설정:');
-  console.log(`   Provider: 토스증권`);
-  console.log(`   API Key: ${TOSS_CONFIG.API_KEY === 'your_toss_api_key_here' ? '❌ 설정 안 됨' : '✅ 설정됨'}`);
+  console.log('\n⏳ 첫 요청을 기다리는 중...\n');
 });
 
 module.exports = app;
